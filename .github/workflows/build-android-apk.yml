@@ -1,0 +1,96 @@
+name: Build HGhub Android APK (ARM64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Initialize Android project
+        run: pnpm tauri android init --ci
+      - name: Build ARM64 release APK
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64
+
+      - name: Sign and verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version")"
+          BT="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+          KS="$RUNNER_TEMP/hghub-build.p12"
+          PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$PASSWORD"
+          trap 'rm -f "$KS"' EXIT
+          keytool -genkeypair -keystore "$KS" -storetype PKCS12 \
+            -storepass "$PASSWORD" -keypass "$PASSWORD" -alias hghub \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=HGhub Personal Build" -noprompt
+          export HGHUB_SIGNING_PASSWORD="$PASSWORD"
+          mapfile -d '' APKS < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*release*.apk' -print0)
+          if [ "${#APKS[@]}" -ne 1 ]; then
+            printf 'Expected one ARM64 release APK; found %s\n' "${#APKS[@]}"
+            exit 1
+          fi
+          mkdir -p artifacts
+          OUT="artifacts/HGhub_${VERSION}_arm64.apk"
+          "$BT/zipalign" -P 16 -f 4 "${APKS[0]}" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias hghub \
+            --ks-pass env:HGHUB_SIGNING_PASSWORD --key-pass env:HGHUB_SIGNING_PASSWORD \
+            --v4-signing-enabled false --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose --print-certs "$OUT"
+          "$BT/zipalign" -c -P 16 4 "$OUT"
+          "$BT/aapt" dump badging "$OUT" | tee "$RUNNER_TEMP/apk-badging.txt"
+          grep -q "native-code: 'arm64-v8a'" "$RUNNER_TEMP/apk-badging.txt"
+          (cd artifacts && sha256sum "$(basename "$OUT")" > SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-Android-arm64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
